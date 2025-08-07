@@ -1,0 +1,13 @@
+streamlit 
+streamlit-chat 
+numpy 
+python-dotenv 
+openai 
+langchain 
+langchain-openai 
+pymongo 
+google-cloud-translate 
+google-cloud-texttospeech 
+google-cloud-speech 
+firebase-admin 
+pydantic

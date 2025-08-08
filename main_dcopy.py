@@ -24,13 +24,10 @@ from forward_copy import save_unanswered_question, save_user_interaction
 # Load environment variables
 dotenv.load_dotenv()
 
-# ✅ Google Application Credentials should be loaded via .env
-# Ensure it's available
 if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
     st.error("GOOGLE_APPLICATION_CREDENTIALS environment variable not set.")
     st.stop()
 
-# Initialize Google Cloud clients
 translator_client: Optional[translate.TranslationServiceClient] = get_translator_client()
 if not translator_client:
     st.warning("Error with Google Cloud Translator client")
@@ -43,7 +40,6 @@ speech_client: Optional[speech.SpeechClient] = get_speech_client()
 if not speech_client:
     st.warning("Google Cloud Speech-to-Text client could not be initialized. Voice input features (if implemented) will be disabled.")
 
-# Language support
 ALLOWED_LANGUAGES: List[str] = ['en', 'ta', 'te', 'hi']
 DEFAULT_LANGUAGE: Literal['en'] = "en"
 SUPPORTED_LANGUAGES: dict[str, str] = {}
@@ -60,6 +56,20 @@ def cosine_similarity_manual(vec1, vec2):
     if norm_vec1 == 0 or norm_vec2 == 0:
         return 0.0
     return dot_product / (norm_vec1 * norm_vec2)
+
+def clean_bot_response(text: str) -> str:
+    phrases_to_remove = [
+        "consult a doctor",
+        "seek medical attention",
+        "contact your healthcare provider",
+        "talk to a medical professional",
+        "reach out to a doctor",
+        "get professional medical advice",
+        "speak to your doctor"
+    ]
+    for phrase in phrases_to_remove:
+        text = text.replace(phrase, "")
+    return text.strip()
 
 tagging_prompt = ChatPromptTemplate.from_template(
     """
@@ -106,7 +116,7 @@ try:
     client = MongoClient(os.environ.get("MONGODB_URI"))
     db = client["pdf_file"]
     collection = db["animal_bites"]
-    _ = db.list_collection_names() # Test connection
+    _ = db.list_collection_names()
 except Exception as e:
     st.error(f"Failed to connect to MongoDB: {e}. Please check your MONGODB_URI and ensure MongoDB is accessible.")
     st.stop()
@@ -118,7 +128,6 @@ if "selected_language" not in st.session_state:
 
 def process_input():
     user_input_original = st.session_state.user_input.strip()
-
     if not user_input_original:
         return
 
@@ -129,7 +138,6 @@ def process_input():
     if not user_input_english.strip():
         user_input_english = user_input_original
 
-    # Rephrase user input for LLM context
     retrieval_prompt_template = f"""Given a chat_history and the latest_user_input question/statement \
 which MIGHT reference context in the chat history, formulate a standalone question/statement \
 which can be understood without the chat history. Do NOT answer the question, \
@@ -142,8 +150,7 @@ latest_user_input:{user_input_english}"""
     if not modified_user_input.strip():
         modified_user_input = user_input_english
 
-    # Classify query type (Casual Greeting vs. Subject-Specific)
-    classification_category = 'Subject-Specific' # Default to subject-specific
+    classification_category = 'Subject-Specific'
     try:
         response_casual_subject = smaller_llm.with_structured_output(CasualSubject).invoke(tagging_prompt.invoke({"input": modified_user_input}))
         classification_category = response_casual_subject.category if isinstance(response_casual_subject, CasualSubject) else response_casual_subject.get('category', 'Subject-Specific')
@@ -156,7 +163,6 @@ latest_user_input:{user_input_english}"""
     if classification_category == 'Subject-Specific':
         try:
             embedding = embeddings_model.embed_query(modified_user_input)
-
             result = collection.aggregate([
                 {
                     "$vectorSearch": {
@@ -177,13 +183,23 @@ latest_user_input:{user_input_english}"""
                     context = context + doc["raw_data"] + "\n\n"
 
             if context.strip():
-                prompt_template = f"""you are a chatbot meant to answer questions related to animal bites, answer the question based on the given context.
-                context:{context}
-                question:{modified_user_input}"""
+                prompt_template = f"""
+                You are a medical expert specializing in the treatment and understanding of animal bites. Using the context provided, answer the user's question with detailed and factual medical information only. 
+                Avoid saying things like "consult a doctor", "seek medical attention", or any other referral phrases. 
+                Assume the user is asking for expert medical guidance from you directly.
+
+            Context:
+            {context}
+
+            Question:
+            {modified_user_input}
+            """
                 response_llm_english_result = llm.invoke(prompt_template).content
                 bot_response_english = response_llm_english_result if isinstance(response_llm_english_result, str) else None
+                if bot_response_english:
+                    bot_response_english = clean_bot_response(bot_response_english)
             else:
-                relevance_category = 'Animal Bite-Related' # Default to Animal Bite-Related
+                relevance_category = 'Animal Bite-Related'
                 try:
                     response_related_not = smaller_llm.with_structured_output(RelatedNot).invoke(tagging_prompt.invoke({"input": modified_user_input}))
                     relevance_category = response_related_not.category if isinstance(response_related_not, RelatedNot) else response_related_not.get('category', 'Animal Bite-Related')
@@ -191,12 +207,9 @@ latest_user_input:{user_input_english}"""
                     st.error(f"Error classifying relevance: {e}. Assuming Animal Bite-Related.")
 
                 if relevance_category == 'Not Animal Bite-Related':
-                    bot_response_english = "Sorry, but I specialize in answering questions related to animal bites.\
-                                    I may not be able to help with your query, but if you have any questions about animal bites, \
-                                    their effects, treatment, or prevention, I'd be happy to assist!"
-                else: 
+                    bot_response_english = "Sorry, but I specialize in answering questions related to animal bites. I may not be able to help with your query, but if you have any questions about animal bites, their effects, treatment, or prevention, I'd be happy to assist!"
+                else:
                     bot_response_english = "I am unable to answer your question at the moment. The Doctor has been notified, please check back in a few days."
-
                     try:
                         save_unanswered_question(user_input_english)
                     except Exception as e:
@@ -205,11 +218,16 @@ latest_user_input:{user_input_english}"""
             st.error(f"Error during subject-specific processing: {e}")
             bot_response_english = "An internal error occurred while processing your request. Please try again."
 
-    else: 
+    else:
         try:
-            bot_response_english_result = llm.invoke(f"""system:you are a friendly chatbot that specializes in medical questions related to animal bites.
-                                question: {user_input_english}""").content
+            bot_response_english_result = llm.invoke(f"""
+You are a warm but expert-level medical assistant trained in answering questions related to animal bites.
+Keep responses informative and concise. Do not use phrases like 'consult a doctor' or 'seek medical attention'.
+User input: {user_input_english}
+""").content
             bot_response_english = bot_response_english_result if isinstance(bot_response_english_result, str) else None
+            if bot_response_english:
+                bot_response_english = clean_bot_response(bot_response_english)
         except Exception as e:
             st.error(f"Error during casual greeting processing: {e}")
             bot_response_english = "An internal error occurred while generating a greeting. Please try again."
@@ -218,29 +236,21 @@ latest_user_input:{user_input_english}"""
 
     try:
         user_session_id = getattr(st.session_state, 'session_id', None)
-    
-        # Responses that should NOT be saved
-        fallback_1 = "Sorry, but I specialize in answering questions related to animal bites.\
-                                        I may not be able to help with your query, but if you have any questions about animal bites, \
-                                        their effects, treatment, or prevention, I'd be happy to assist!"
+
+        fallback_1 = "Sorry, but I specialize in answering questions related to animal bites. I may not be able to help with your query, but if you have any questions about animal bites, their effects, treatment, or prevention, I'd be happy to assist!"
         fallback_2 = "I am unable to answer your question at the moment. The Doctor has been notified, please check back in a few days."
-    
-        # Clean up whitespace from responses for accurate comparison
+
         cleaned_response = bot_response_english.strip()
-    
-        # ✅ Save only if not a casual greeting AND not a fallback response
         if classification_category != 'Casual Greeting' and cleaned_response not in [fallback_1.strip(), fallback_2.strip()]:
             save_user_interaction(user_input_english, bot_response_english, user_session_id)
-    
     except Exception as e:
         st.error(f"Error saving user interaction: {e}")
-    
+
     st.session_state.chat_history.append((user_input_original, bot_response))
     st.session_state.user_input = ""
 
 def display_chat():
     os.makedirs("tts_audio", exist_ok=True)
-
     for i, (user_msg, bot_msg) in enumerate(st.session_state.chat_history):
         message(user_msg, is_user=True, key=f"user_msg_{i}")
         message(bot_msg, key=f"bot_msg_{i}")
@@ -264,9 +274,7 @@ def display_chat():
                     name=voice_name if voice_name else None,
                     ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
                 )
-                audio_config = texttospeech.AudioConfig(
-                    audio_encoding=texttospeech.AudioEncoding.MP3
-                )
+                audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
                 response_tts = texttospeech_client.synthesize_speech(
                     request={"input": synthesis_input, "voice": voice, "audio_config": audio_config}
                 )
@@ -280,7 +288,7 @@ def display_chat():
 
         if audio_file_path and os.path.exists(audio_file_path):
             with st.container():
-                if st.button(f"Play response {i}",key=f"play_audio_btn_{i}"):
+                if st.button(f"Play response {i}", key=f"play_audio_btn_{i}"):
                     audio_file = open(audio_file_path, "rb")
                     audio_bytes = audio_file.read()
                     st.audio(audio_bytes, format="audio/mp3", start_time=0)
